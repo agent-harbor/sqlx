@@ -60,18 +60,28 @@ pub fn resolve_blocking(path: &Path) -> Result<Vec<(Migration, PathBuf)>, Resolv
         source: Some(e),
     })?;
 
+    resolve_blocking_from_entries(
+        path,
+        s.map(|entry| entry.map(|entry| (entry.path(), entry.file_name()))),
+    )
+}
+
+fn resolve_blocking_from_entries(
+    path: &Path,
+    entries: impl IntoIterator<Item = io::Result<(PathBuf, std::ffi::OsString)>>,
+) -> Result<Vec<(Migration, PathBuf)>, ResolveError> {
+    let s = entries;
+
     let mut migrations = Vec::new();
 
     for res in s {
-        let entry = res.map_err(|e| ResolveError {
+        let (entry_path, file_name) = res.map_err(|e| ResolveError {
             message: format!(
                 "error reading contents of migration directory {}: {e}",
                 path.display()
             ),
             source: Some(e),
         })?;
-
-        let entry_path = entry.path();
 
         let metadata = fs::metadata(&entry_path).map_err(|e| ResolveError {
             message: format!(
@@ -86,7 +96,6 @@ pub fn resolve_blocking(path: &Path) -> Result<Vec<(Migration, PathBuf)>, Resolv
             continue;
         }
 
-        let file_name = entry.file_name();
         // This is arguably the wrong choice,
         // but it really only matters for parsing the version and description.
         //
@@ -138,8 +147,85 @@ pub fn resolve_blocking(path: &Path) -> Result<Vec<(Migration, PathBuf)>, Resolv
         ));
     }
 
-    // Ensure that we are sorted by version in ascending order.
-    migrations.sort_by_key(|(m, _)| m.version);
+    // Backport transact-rs/sqlx#4136 (66533fa12cc544a123d75f977b3ac6de48415b22):
+    // equal-version reversible migrations must use the canonical Simple, Up,
+    // Down enum order instead of inheriting filesystem enumeration order.
+    migrations.sort();
 
     Ok(migrations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "sqlx-core-migration-order-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("failed to create migration test directory");
+            Self(path)
+        }
+
+        fn migration(&self, file_name: &str) -> PathBuf {
+            let path = self.0.join(file_name);
+            fs::write(&path, format!("-- {file_name}\n"))
+                .expect("failed to write migration fixture");
+            path
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("failed to remove migration test directory");
+        }
+    }
+
+    fn entry(path: PathBuf) -> io::Result<(PathBuf, OsString)> {
+        let file_name = path
+            .file_name()
+            .expect("fixture migration path must have a file name")
+            .to_owned();
+        Ok((path, file_name))
+    }
+
+    #[test]
+    fn source_resolution_canonicalizes_versions_and_reversible_directions() {
+        let directory = TestDirectory::new();
+        let first = directory.migration("1_first.sql");
+        let up = directory.migration("2_reversible.up.sql");
+        let down = directory.migration("2_reversible.down.sql");
+        let last = directory.migration("3_last.sql");
+
+        // Deliberately put Down before Up. A version-only stable sort preserves
+        // that input order and makes this assertion fail.
+        let migrations = resolve_blocking_from_entries(
+            &directory.0,
+            [entry(down), entry(last), entry(up), entry(first)],
+        )
+        .expect("migration fixtures should resolve");
+
+        let ordering_keys: Vec<_> = migrations
+            .iter()
+            .map(|(migration, _)| (migration.version, migration.migration_type))
+            .collect();
+        assert_eq!(
+            ordering_keys,
+            vec![
+                (1, MigrationType::Simple),
+                (2, MigrationType::ReversibleUp),
+                (2, MigrationType::ReversibleDown),
+                (3, MigrationType::Simple),
+            ]
+        );
+    }
 }
