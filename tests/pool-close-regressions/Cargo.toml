@@ -1,0 +1,28 @@
+[package]
+name = "sqlx-pool-close-regressions"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# This independent consumer mirrors Agent Harbor's actual dependency shape:
+# registry 0.8.0 drivers plus this fork's core-only backport. It does not
+# compile unrelated old workspace driver sources as current-toolchain members.
+[workspace]
+
+[dependencies]
+anyhow = "=1.0.102"
+futures = "=0.3.32"
+sqlx = { version = "=0.8.0", default-features = false, features = ["sqlite", "postgres", "runtime-tokio"] }
+tempfile = "=3.27.0"
+tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+[patch.crates-io]
+sqlx-core = { path = "../../sqlx-core" }
+
+[[test]]
+name = "sqlite-pool-close"
+path = "../sqlite/pool_close.rs"
+
+[[test]]
+name = "postgres-pool-close-listener"
+path = "../postgres/pool_close_listener.rs"

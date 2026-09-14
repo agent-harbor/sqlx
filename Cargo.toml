@@ -223,6 +223,16 @@ path = "tests/sqlite/any.rs"
 required-features = ["sqlite"]
 
 [[test]]
+name = "sqlite-pool-close"
+path = "tests/sqlite/pool_close.rs"
+required-features = ["sqlite", "runtime-tokio"]
+
+[[test]]
+name = "postgres-pool-close-listener"
+path = "tests/postgres/pool_close_listener.rs"
+required-features = ["postgres", "runtime-tokio"]
+
+[[test]]
 name = "sqlite-types"
 path = "tests/sqlite/types.rs"
 required-features = ["sqlite"]

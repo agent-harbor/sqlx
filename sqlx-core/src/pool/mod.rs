@@ -398,8 +398,8 @@ impl<DB: Database> Pool<DB> {
     /// rather than being returned to the pool.
     ///
     /// Returns a `Future` which can be `.await`ed to ensure all connections are
-    /// gracefully closed. It will first close any idle connections currently waiting in the pool,
-    /// then wait for all checked-out connections to be returned or closed.
+    /// gracefully closed. It first waits for all checked-out connections to be returned or closed,
+    /// then closes every idle connection, including any returned while it was waiting.
     ///
     /// Waiting for connections to be gracefully closed is optional, but will allow the database
     /// server to clean up the resources sooner rather than later. This is especially important

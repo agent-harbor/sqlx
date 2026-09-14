@@ -11,7 +11,7 @@ use crate::sync::{AsyncSemaphore, AsyncSemaphoreReleaser};
 use std::cmp;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::Poll;
 
 use crate::logger::private_level_filter_to_trace_level;
@@ -26,6 +26,11 @@ pub(crate) struct PoolInner<DB: Database> {
     pub(super) connect_options: RwLock<Arc<<DB::Connection as Connection>::Options>>,
     pub(super) idle_conns: ArrayQueue<Idle<DB>>,
     pub(super) semaphore: AsyncSemaphore,
+    // Total permits owned by this pool, not live connections or available
+    // permits. Child pools retain borrowed permits when a connection closes.
+    // The same short lock serializes parent-to-child transfers with mark_closed;
+    // once closed, this count is immutable and close can await every owner.
+    num_permits: Mutex<u32>,
     pub(super) size: AtomicU32,
     pub(super) num_idle: AtomicUsize,
     is_closed: AtomicBool,
@@ -55,6 +60,7 @@ impl<DB: Database> PoolInner<DB> {
             connect_options: RwLock::new(Arc::new(connect_options)),
             idle_conns: ArrayQueue::new(capacity),
             semaphore: AsyncSemaphore::new(options.fair, semaphore_capacity),
+            num_permits: Mutex::new(semaphore_capacity as u32),
             size: AtomicU32::new(0),
             num_idle: AtomicUsize::new(0),
             is_closed: AtomicBool::new(false),
@@ -89,7 +95,14 @@ impl<DB: Database> PoolInner<DB> {
     }
 
     fn mark_closed(&self) {
-        self.is_closed.store(true, Ordering::Release);
+        {
+            let _permits = self
+                .num_permits
+                .lock()
+                .expect("permit lock holder panicked");
+            self.is_closed.store(true, Ordering::Release);
+        }
+        // Do not invoke listener wakeups while holding the bookkeeping lock.
         self.on_closed.notify(usize::MAX);
     }
 
@@ -97,19 +110,23 @@ impl<DB: Database> PoolInner<DB> {
         self.mark_closed();
 
         async move {
-            for permits in 1..=self.options.max_connections {
-                // Close any currently idle connections in the pool.
-                while let Some(idle) = self.idle_conns.pop() {
-                    let _ = idle.live.float((*self).clone()).close().await;
-                }
+            // Unlike live size, this includes a child's retained spare permits.
+            // mark_closed froze transfers, so no later acquisition can increase
+            // this target. Holding all owned permits also serializes aliases
+            // until the actual idle-worker close acknowledgements finish.
+            let permits_to_acquire = *self
+                .num_permits
+                .lock()
+                .expect("permit lock holder panicked");
 
-                if self.size() == 0 {
-                    break;
-                }
+            let _permits = self.semaphore.acquire(permits_to_acquire).await;
 
-                // Wait for all permits to be released.
-                let _permits = self.semaphore.acquire(permits).await;
+            while let Some(idle) = self.idle_conns.pop() {
+                let _ = idle.live.raw.close().await;
             }
+
+            self.num_idle.store(0, Ordering::Release);
+            self.size.store(0, Ordering::Release);
         }
     }
 
@@ -121,8 +138,9 @@ impl<DB: Database> PoolInner<DB> {
 
     /// Attempt to pull a permit from `self.semaphore` or steal one from the parent.
     ///
-    /// If we steal a permit from the parent but *don't* open a connection,
-    /// it should be returned to the parent.
+    /// A successful transfer becomes child capacity until the child is dropped,
+    /// including when opening a connection is cancelled or fails. A parent
+    /// permit that was only queued/reserved is returned when its future drops.
     async fn acquire_permit<'a>(self: &'a Arc<Self>) -> Result<AsyncSemaphoreReleaser<'a>, Error> {
         let parent = self
             .parent()
@@ -134,7 +152,7 @@ impl<DB: Database> PoolInner<DB> {
         let mut close_event = self.close_event();
 
         if let Some(parent) = parent {
-            let acquire_parent = parent.0.semaphore.acquire(1);
+            let acquire_parent = parent.0.semaphore.acquire(1).fuse();
             let parent_close_event = parent.0.close_event();
 
             futures_util::pin_mut!(
@@ -163,7 +181,65 @@ impl<DB: Database> PoolInner<DB> {
 
                 // Don't try the parent right away.
                 if poll_parent {
-                    acquire_parent.as_mut().poll(cx).map(Ok)
+                    // Polling or dropping a semaphore acquisition can wake its
+                    // waiters, so neither happens under our bookkeeping lock.
+                    let mut parent_permit = match acquire_parent.as_mut().poll(cx) {
+                        Poll::Ready(permit) => Some(permit),
+                        Poll::Pending => None,
+                    };
+                    let (transferred, at_capacity) = {
+                        let mut num_permits = self
+                            .num_permits
+                            .lock()
+                            .expect("permit lock holder panicked");
+                        // Close may have raced the earlier event check. Transfer
+                        // and close publication must share this critical section.
+                        if self.is_closed() {
+                            return Poll::Ready(Err(Error::PoolClosed));
+                        }
+                        let transferred = if *num_permits < self.options.max_connections {
+                            if let Some(permit) = parent_permit.take() {
+                                permit.disarm();
+                                *num_permits += 1;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        (transferred, *num_permits == self.options.max_connections)
+                    };
+                    // Publish an already-counted transfer without an intervening
+                    // await. A racing close includes it and waits for this credit.
+                    if transferred {
+                        self.semaphore.release(1);
+                    }
+                    drop(parent_permit);
+                    if at_capacity {
+                        // Another borrower may have filled the child. Cancel
+                        // even a reserved parent acquisition outside the lock.
+                        acquire_parent.set(future::Fuse::terminated());
+                    }
+                    // Keep the original queued child acquisition. Never return
+                    // a parent-origin guard after recording child ownership:
+                    // cancellation must release capacity to the child semaphore.
+                    match acquire_self.as_mut().poll(cx) {
+                        Poll::Ready(permit) => Poll::Ready(Ok(permit)),
+                        Poll::Pending => {
+                            if transferred && !at_capacity {
+                                // This transfer may have served an older child
+                                // waiter. Each parent future transfers once,
+                                // but this borrower must keep making progress
+                                // while child capacity remains. Keep its queue
+                                // position and arrange a real poll of a NEW
+                                // parent future, rather than a terminated Fuse.
+                                acquire_parent.set(parent.0.semaphore.acquire(1).fuse());
+                                cx.waker().wake_by_ref();
+                            }
+                            Poll::Pending
+                        }
+                    }
                 } else {
                     poll_parent = true;
                     cx.waker().wake_by_ref();
