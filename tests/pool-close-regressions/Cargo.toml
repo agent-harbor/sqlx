@@ -1,0 +1,48 @@
+[package]
+name = "sqlx-pool-close-regressions"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# This independent consumer mirrors Agent Harbor's actual dependency shape:
+# registry 0.8.0 drivers plus this fork's core-only backport. It does not
+# compile unrelated old workspace driver sources as current-toolchain members.
+[workspace]
+
+[features]
+# ON BY DEFAULT here, and listed in the `sqlite-pool-close` target's
+# `required-features` below. Turning on this crate's own feature is what makes
+# `#[cfg(feature = "_test-pool-donation-barrier")]` inside the shared test file
+# evaluate to true, and it forwards to the identically named non-default seam in
+# the patched core that `parent_close_refuses_a_donation_that_races_its_mark_closed`
+# needs. Agent Harbor's production dependency does NOT enable it, so production
+# keeps building the code with the seam and its static entirely absent.
+#
+# The `required-features` entry is deliberate: if this seam is ever switched off
+# here, cargo declines to build the target at all, so the whole SQLite file
+# disappears from the run instead of this single case quietly vanishing from an
+# otherwise green suite.
+default = ["_test-pool-donation-barrier"]
+_test-pool-donation-barrier = ["sqlx-core/_test-pool-donation-barrier"]
+
+[dependencies]
+anyhow = "=1.0.102"
+futures = "=0.3.32"
+sqlx = { version = "=0.8.0", default-features = false, features = ["sqlite", "postgres", "runtime-tokio"] }
+# Direct edge onto the same patched core `sqlx` resolves to, so the feature
+# above has something to forward through.
+sqlx-core = { path = "../../sqlx-core", default-features = false }
+tempfile = "=3.27.0"
+tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+[patch.crates-io]
+sqlx-core = { path = "../../sqlx-core" }
+
+[[test]]
+name = "sqlite-pool-close"
+path = "../sqlite/pool_close.rs"
+required-features = ["_test-pool-donation-barrier"]
+
+[[test]]
+name = "postgres-pool-close-listener"
+path = "../postgres/pool_close_listener.rs"

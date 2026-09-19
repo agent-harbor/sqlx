@@ -95,6 +95,15 @@ runtime-tokio-rustls = ["runtime-tokio", "tls-rustls"]
 _rt-async-std = []
 _rt-tokio = []
 
+# Test-only. Forwards `sqlx-core`'s non-default donation-barrier seam (see that
+# crate's `pool::donation_barrier`) so the one case in the `sqlite-pool-close`
+# test target that needs a deterministic donation/parent-close interleaving can
+# be compiled. NON-DEFAULT and referenced by no other feature: a production
+# build of `sqlx` never enables it, and `cargo test --features sqlite,runtime-tokio`
+# simply compiles the target without that single case. Enable it explicitly
+# (`--features sqlite,runtime-tokio,_test-pool-donation-barrier`) to run it.
+_test-pool-donation-barrier = ["sqlx-core/_test-pool-donation-barrier"]
+
 # database
 any = ["sqlx-core/any", "sqlx-mysql?/any", "sqlx-postgres?/any", "sqlx-sqlite?/any"]
 postgres = ["sqlx-postgres", "sqlx-macros?/postgres"]
@@ -221,6 +230,16 @@ required-features = ["sqlite"]
 name = "sqlite-any"
 path = "tests/sqlite/any.rs"
 required-features = ["sqlite"]
+
+[[test]]
+name = "sqlite-pool-close"
+path = "tests/sqlite/pool_close.rs"
+required-features = ["sqlite", "runtime-tokio"]
+
+[[test]]
+name = "postgres-pool-close-listener"
+path = "tests/postgres/pool_close_listener.rs"
+required-features = ["postgres", "runtime-tokio"]
 
 [[test]]
 name = "sqlite-types"

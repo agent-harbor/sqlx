@@ -89,6 +89,12 @@ mod connection;
 mod inner;
 mod options;
 
+// Test-only seam; see the module's own documentation for why it cannot be a
+// `#[cfg(test)]` item. With the non-default feature off this module does not
+// exist, so it contributes nothing to the public API or to a production build.
+#[cfg(feature = "_test-pool-donation-barrier")]
+pub mod donation_barrier;
+
 pub use self::connection::PoolConnection;
 pub use self::options::{PoolConnectionMetadata, PoolOptions};
 
@@ -398,8 +404,8 @@ impl<DB: Database> Pool<DB> {
     /// rather than being returned to the pool.
     ///
     /// Returns a `Future` which can be `.await`ed to ensure all connections are
-    /// gracefully closed. It will first close any idle connections currently waiting in the pool,
-    /// then wait for all checked-out connections to be returned or closed.
+    /// gracefully closed. It first waits for all checked-out connections to be returned or closed,
+    /// then closes every idle connection, including any returned while it was waiting.
     ///
     /// Waiting for connections to be gracefully closed is optional, but will allow the database
     /// server to clean up the resources sooner rather than later. This is especially important
@@ -411,6 +417,36 @@ impl<DB: Database> Pool<DB> {
     /// spawned by `Pool` internally and so may be unpredictable otherwise.
     ///
     /// `.close()` may be safely called and `.await`ed on multiple handles concurrently.
+    ///
+    /// Parent and child pools
+    /// ======================
+    /// A pool created with `PoolOptions::parent` (an internal-only API) borrows
+    /// capacity from its parent, and that capacity becomes the child's until the
+    /// **child pool itself is dropped** — closing the child is not enough.
+    ///
+    /// Consequently each pool's `close()` waits only for the capacity that pool
+    /// still owns:
+    ///
+    /// * Closing a **parent** does not wait for capacity a child borrowed, and
+    ///   does not close, drain or disturb the child's connections. It does stop
+    ///   the child from borrowing any more, so the child's subsequent
+    ///   [`acquire`][Pool::acquire] calls fail with [`Error::PoolClosed`].
+    /// * Closing a **child** waits for every permit the child borrowed,
+    ///   including ones it is no longer using, and returns none of them to the
+    ///   parent; they go back only when the child pool is dropped.
+    ///
+    /// A connection removed from a child with [`PoolConnection::leak`] keeps its
+    /// permit out of circulation permanently, so the parent never regains that
+    /// slot. This matches the documented behaviour of `leak()`, and the
+    /// **parent's** `close()` still completes: the parent is credited only with
+    /// the permits actually released back to it, never with the ones it donated.
+    ///
+    /// The pool that leaked, however, can no longer complete its **own**
+    /// `close()`: `leak()` never returns the permit to that pool's semaphore and
+    /// never decrements its `size`, so a close waiting for its own capacity
+    /// waits forever. That is pre-existing `leak()` behaviour, unchanged here,
+    /// and it applies to a parentless pool exactly as it does to a child. Close
+    /// a pool before leaking from it, or do not close it at all.
     pub fn close(&self) -> impl Future<Output = ()> + '_ {
         self.0.close()
     }

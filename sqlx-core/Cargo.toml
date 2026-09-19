@@ -25,6 +25,14 @@ _tls-native-tls = ["native-tls"]
 _tls-rustls = ["rustls", "rustls-pemfile", "webpki-roots"]
 _tls-none = []
 
+# Test-only synchronisation seam in the parent/child permit donation path.
+# NON-DEFAULT and never enabled by a production build: it exists so an external
+# regression crate can park a donation inside the window in which a parent's
+# `close()` publishes `is_closed`, which no deterministic single-threaded
+# schedule can reach. With this feature off, neither `pool::donation_barrier`
+# nor its call site in `pool::inner` is compiled. See that module's docs.
+_test-pool-donation-barrier = []
+
 # support offline/decoupled building (enables serialization of `Describe`)
 offline = ["serde", "either/serde"]
 
